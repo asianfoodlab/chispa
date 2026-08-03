@@ -1,0 +1,6 @@
+# Plan files carry client names and dates of birth - never commit them.
+*.tsv
+*.xlsx
+*.csv
+.state/
+logs/
