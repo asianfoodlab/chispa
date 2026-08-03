@@ -1,0 +1,27 @@
+# Video formats excluded from the migration.
+# Character classes make the match case-insensitive on every rclone version,
+# so .MOV and .mov are both caught. Remove a line to include that format.
+
+- *.[mM][pP]4
+- *.[mM][oO][vV]
+- *.[mM]4[vV]
+- *.[aA][vV][iI]
+- *.[wW][mM][vV]
+- *.[mM][kK][vV]
+- *.[mM][pP][gG]
+- *.[mM][pP][eE][gG]
+- *.3[gG][pP]
+- *.3[gG]2
+- *.[wW][eE][bB][mM]
+- *.[fF][lL][vV]
+- *.[fF]4[vV]
+- *.[mM][tT][sS]
+- *.[mM]2[tT][sS]
+- *.[mM]2[vV]
+- *.[vV][oO][bB]
+- *.[oO][gG][vV]
+- *.[rR][mM]
+- *.[aA][sS][fF]
+- *.[dD][iI][vV][xX]
+- *.[mM][xX][fF]
+- *.[tT][sS]

@@ -10,10 +10,12 @@
 #   ./migrate.sh --pass 1 --go --only Abbott
 #   ./migrate.sh --pass 1 --verify        # compare file counts, both sides
 #
-# Passes split on file size, because a handful of folders hold nearly all the
-# bytes as video:
+# Video files are excluded from every pass - see video-excludes.txt. Pass
+# --include-video to override that.
+#
+# Passes split on file size:
 #   1  = files under 100M  (the clinical documents; fast)
-#   2  = files 100M and over (video, archives; slow)
+#   2  = files 100M and over (archives, oversized scans; slower)
 #   all = no size filter
 #
 # Resumable. Each folder that finishes cleanly is recorded in .state/, and
@@ -26,11 +28,13 @@ SF_REMOTE="${SF_REMOTE:-sharefile}"
 SRC_ROOT="${SRC_ROOT:-_Client Documentation}"
 PLAN="${PLAN:-migrate_plan.tsv}"
 SIZE_SPLIT="${SIZE_SPLIT:-100M}"
+VIDEO_EXCLUDES="${VIDEO_EXCLUDES:-video-excludes.txt}"
 
 PASS=1
 GO=0
 VERIFY=0
 ONLY=""
+SKIP_VIDEO=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --only)   ONLY="$2"; shift 2 ;;
     --go)     GO=1; shift ;;
     --verify) VERIFY=1; shift ;;
+    --include-video) SKIP_VIDEO=0; shift ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -53,6 +58,20 @@ esac
 
 [[ -f "$PLAN" ]] || { echo "plan file not found: $PLAN" >&2; exit 1; }
 command -v rclone >/dev/null || { echo "rclone not found" >&2; exit 1; }
+
+# Video is excluded by extension rather than by size, so a short clip that
+# happens to be small still gets left behind. Applied to copies and to
+# verification alike, so both sides are counted on the same basis.
+if [[ $SKIP_VIDEO -eq 1 ]]; then
+  [[ -f "$VIDEO_EXCLUDES" ]] || {
+    echo "video exclude list not found: $VIDEO_EXCLUDES" >&2
+    echo "(put it beside this script, or pass --include-video to migrate video too)" >&2
+    exit 1
+  }
+  FILTER=(${SIZE_FILTER[@]+"${SIZE_FILTER[@]}"} --exclude-from "$VIDEO_EXCLUDES")
+else
+  FILTER=(${SIZE_FILTER[@]+"${SIZE_FILTER[@]}"})
+fi
 
 mkdir -p .state logs
 STATE=".state/done-pass${PASS}.txt"
@@ -77,7 +96,7 @@ RCLONE_FLAGS=(
 
 # file count for a remote path, applying the current pass filter
 count_files() {
-  rclone size "$1" "${SIZE_FILTER[@]}" --json 2>/dev/null \
+  rclone size "$1" ${FILTER[@]+"${FILTER[@]}"} --json 2>/dev/null \
     | sed -n 's/.*"count":\([0-9]*\).*/\1/p'
 }
 
@@ -85,7 +104,14 @@ total=0; skipped=0; copied=0; failed=0
 declare -a FAILED_ROWS=()
 
 printf '%s\n' "plan:        $PLAN"
-printf '%s\n' "pass:        $PASS  (${SIZE_FILTER[*]:-no size filter})"
+SIZE_DESC="no size filter"
+[[ ${#SIZE_FILTER[@]} -gt 0 ]] && SIZE_DESC="${SIZE_FILTER[*]}"
+printf '%s\n' "pass:        $PASS  ($SIZE_DESC)"
+if [[ $SKIP_VIDEO -eq 1 ]]; then
+  printf '%s\n' "video:       excluded ($VIDEO_EXCLUDES)"
+else
+  printf '%s\n' "video:       INCLUDED"
+fi
 printf '%s\n' "source:      ${GDRIVE_REMOTE}:${SRC_ROOT}/"
 printf '%s\n' "destination: ${SF_REMOTE}:"
 if [[ $VERIFY -eq 1 ]]; then
@@ -130,7 +156,7 @@ while IFS=$'\t' read -r dest src files mb match; do
   fi
 
   printf '[%d] %s\n' "$total" "$dest"
-  if rclone copy "$src_path" "$dst_path" "${SIZE_FILTER[@]}" "${RCLONE_FLAGS[@]}"; then
+  if rclone copy "$src_path" "$dst_path" ${FILTER[@]+"${FILTER[@]}"} "${RCLONE_FLAGS[@]}"; then
     printf '%s\n' "$dest" >> "$STATE"
     copied=$((copied + 1))
   else
