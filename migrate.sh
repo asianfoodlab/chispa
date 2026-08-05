@@ -182,17 +182,31 @@ plan_folder() {
       if (pass == "2" && sz <  limit) return 0
       return 1
     }
-    NR == FNR { if (keep($1, $3)) n[$1]++; next }
+    function suffixed(path, k,   i) {
+      i = match(path, /\.[^.\/]+$/)
+      return i ? substr(path, 1, i-1) " (" k ")" substr(path, i) \
+               : path " (" k ")"
+    }
+    NR == FNR { if (keep($1, $3)) { n[$1]++; orig[$1] = 1 } ; next }
     {
       if (!keep($1, $3)) next
-      if (n[$1] == 1) { print $1 > uniq; next }
+      if (n[$1] == 1) { print $1 > uniq; used[$1] = 1; next }
       k = ++seen[$1]
-      target = $1
-      if (k > 1) {
-        i = match($1, /\.[^.\/]+$/)
-        target = (i ? substr($1, 1, i-1) " (" k ")" substr($1, i) \
-                    : $1 " (" k ")")
+      if (k == 1) {
+        target = $1
+      } else {
+        # Drive may already hold a file genuinely named "X (2).pdf" alongside
+        # two copies of "X.pdf". Handing the second copy that same name would
+        # quietly overwrite the real one at the far end, so walk past anything
+        # already spoken for - by an original name or an earlier rename.
+        j = k
+        while (1) {
+          target = suffixed($1, j)
+          if (!(target in orig) && !(target in used)) break
+          j++
+        }
       }
+      used[target] = 1
       print $2, target > dup
     }
   ' "$1" "$1"
