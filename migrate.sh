@@ -56,6 +56,12 @@
 
 set -uo pipefail
 
+# Noted before the defaults below fill them in, so --gentle can tell an
+# explicit choice from an unset variable and leave the explicit one alone.
+for v in TPSLIMIT TRANSFERS CHECKERS BWLIMIT; do
+  eval "_set_$v=\"\${$v+yes}\""
+done
+
 GDRIVE_REMOTE="${GDRIVE_REMOTE:-gdrive}"
 SF_REMOTE="${SF_REMOTE:-sharefile}"
 SRC_ROOT="${SRC_ROOT:-_Client Documentation}"
@@ -64,6 +70,12 @@ SIZE_SPLIT_BYTES="${SIZE_SPLIT_BYTES:-104857600}"   # 100 MiB
 EXPORT_FORMATS="${EXPORT_FORMATS:-docx,xlsx,pptx}"
 TPSLIMIT="${TPSLIMIT:-10}"      # Google API calls/sec; raise if throughput is poor
 TRANSFERS="${TRANSFERS:-4}"     # concurrent file transfers
+CHECKERS="${CHECKERS:-8}"       # concurrent "does this already exist" probes
+# Upload:download. Every file is pulled from Drive and pushed to ShareFile, so
+# the run uses as much upload as download - and home connections have far less
+# upload to give. Saturating it is what makes everything else feel broken, so
+# the two are limited separately. Empty means no limit.
+BWLIMIT="${BWLIMIT:-}"
 VIDEO_RE='\.(mp4|mov|m4v|avi|wmv|mkv|mpg|mpeg|3gp|3g2|webm|flv|f4v|mts|m2ts|m2v|vob|ogv|rm|asf|divx|mxf|ts)$'
 
 PASS=1
@@ -73,6 +85,7 @@ ONLY=""
 SKIP_VIDEO=1
 SHARD_I=1
 SHARD_N=1
+GENTLE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -80,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --plan)   PLAN="$2"; shift 2 ;;
     --only)   ONLY="$2"; shift 2 ;;
     --shard)  SHARD_I="${2%%/*}"; SHARD_N="${2##*/}"; shift 2 ;;
+    --gentle) GENTLE=1; shift ;;
     --go)     GO=1; shift ;;
     --verify) VERIFY=1; shift ;;
     --include-video) SKIP_VIDEO=0; shift ;;
@@ -99,6 +113,16 @@ esac
 if [[ $SHARD_N -lt 1 || $SHARD_I -lt 1 || $SHARD_I -gt $SHARD_N ]]; then
   echo "--shard must look like 2/3, with the first number no bigger" >&2
   exit 2
+fi
+
+# --gentle: stay well under a home connection's upload ceiling and keep the
+# number of open connections small, so the machine stays comfortable to work
+# on. These are per process - three shards means three times the bandwidth.
+if [[ $GENTLE -eq 1 ]]; then
+  [[ -z "${_set_BWLIMIT:-}" ]]   && BWLIMIT="150k:1M"
+  [[ -z "${_set_TRANSFERS:-}" ]] && TRANSFERS=1
+  [[ -z "${_set_CHECKERS:-}" ]]  && CHECKERS=2
+  [[ -z "${_set_TPSLIMIT:-}" ]]  && TPSLIMIT=4
 fi
 
 [[ -f "$PLAN" ]] || { echo "plan file not found: $PLAN" >&2; exit 1; }
@@ -122,15 +146,26 @@ COMMON=(
   --low-level-retries 10
   --drive-pacer-min-sleep 100ms
 )
+[[ -n "$BWLIMIT" ]] && COMMON+=(--bwlimit "$BWLIMIT")
+
 COPY_FLAGS=(
   "${COMMON[@]}"
   --transfers "$TRANSFERS"
-  --checkers 8
-  --stats 30s
+  --checkers "$CHECKERS"
+  --stats 20s
   --stats-one-line
-  --log-file "$LOG"
-  --log-level INFO
 )
+
+# rclone writes its log to stderr. Everything goes to the log file, but only
+# the periodic totals and anything gone wrong reach the screen - otherwise a
+# tab grinding through a 380 file folder prints its heading and then looks
+# dead for an hour. grep exiting 1 on no match must not read as failure, so it
+# is wrapped; pipefail still surfaces a genuine rclone failure.
+rc() {
+  rclone "$@" --log-level INFO 2>&1 \
+    | tee -a "$LOG" \
+    | { grep --line-buffered -E 'Transferred:|ERROR|Failed to' || true; }
+}
 
 # Split one folder's listing into the files we can copy by path (unique names)
 # and the ones that need fetching by ID (duplicated names).
@@ -173,6 +208,9 @@ printf '%s\n' "google docs: exported as $EXPORT_FORMATS"
 printf '%s\n' "source:      ${GDRIVE_REMOTE}:${SRC_ROOT}/"
 printf '%s\n' "destination: ${SF_REMOTE}:"
 [[ $SHARD_N -gt 1 ]] && printf '%s\n' "shard:       $SHARD_I of $SHARD_N"
+printf '%s\n' "limits:      ${BWLIMIT:-no bandwidth cap} (up:down), \
+$TRANSFERS transfers, $CHECKERS checkers, $TPSLIMIT calls/sec\
+$([[ $SHARD_N -gt 1 ]] && echo "  - per shard, so x$SHARD_N in total")"
 if [[ $VERIFY -eq 1 ]]; then
   printf '%s\n' "mode:        VERIFY (reads only)"
 elif [[ $GO -eq 1 ]]; then
@@ -243,7 +281,7 @@ while IFS=$'\t' read -r dest src files mb match; do
 
   ok=1
   if [[ $n_uniq -gt 0 ]]; then
-    rclone copy "$src_path" "$dst_path" --files-from "$UNIQ" "${COPY_FLAGS[@]}" || ok=0
+    rc copy "$src_path" "$dst_path" --files-from "$UNIQ" "${COPY_FLAGS[@]}" || ok=0
   fi
 
   # Duplicates: fetch by Drive ID so the right file lands under the right name.
@@ -257,8 +295,7 @@ while IFS=$'\t' read -r dest src files mb match; do
       mkdir -p "$td/$(dirname "$target")"
       IDARGS+=("$id" "$td/$target")
     done < "$DUP"
-    if ! rclone backend copyid "${GDRIVE_REMOTE}:" "${IDARGS[@]}" \
-           "${COMMON[@]}" --log-file "$LOG" --log-level INFO; then
+    if ! rc backend copyid "${GDRIVE_REMOTE}:" "${IDARGS[@]}" "${COMMON[@]}"; then
       printf '     could not fetch some duplicates\n'; ok=0
     fi
     got=$(find "$td" -type f | wc -l | tr -d ' ')
@@ -266,7 +303,7 @@ while IFS=$'\t' read -r dest src files mb match; do
       printf '     fetched %s of %s duplicates\n' "$got" "$n_dup"; ok=0
     fi
     if [[ "$got" -gt 0 ]]; then
-      rclone copy "$td" "$dst_path" "${COPY_FLAGS[@]}" || {
+      rc copy "$td" "$dst_path" "${COPY_FLAGS[@]}" || {
         printf '     could not upload duplicates\n'; ok=0; }
     fi
     rm -rf "$td"
