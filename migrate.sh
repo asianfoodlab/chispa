@@ -46,6 +46,8 @@ SRC_ROOT="${SRC_ROOT:-_Client Documentation}"
 PLAN="${PLAN:-migrate_plan.tsv}"
 SIZE_SPLIT_BYTES="${SIZE_SPLIT_BYTES:-104857600}"   # 100 MiB
 EXPORT_FORMATS="${EXPORT_FORMATS:-docx,xlsx,pptx}"
+TPSLIMIT="${TPSLIMIT:-10}"      # Google API calls/sec; raise if throughput is poor
+TRANSFERS="${TRANSFERS:-4}"     # concurrent file transfers
 VIDEO_RE='\.(mp4|mov|m4v|avi|wmv|mkv|mpg|mpeg|3gp|3g2|webm|flv|f4v|mts|m2ts|m2v|vob|ogv|rm|asf|divx|mxf|ts)$'
 
 PASS=1
@@ -87,14 +89,14 @@ trap 'rm -rf "$WORK"' EXIT
 # progress and made throttling failures much harder to diagnose.
 COMMON=(
   --drive-export-formats "$EXPORT_FORMATS"
-  --tpslimit 10
+  --tpslimit "$TPSLIMIT"
   --retries 3
   --low-level-retries 10
   --drive-pacer-min-sleep 100ms
 )
 COPY_FLAGS=(
   "${COMMON[@]}"
-  --transfers 4
+  --transfers "$TRANSFERS"
   --checkers 8
   --stats 30s
   --stats-one-line
@@ -211,21 +213,30 @@ while IFS=$'\t' read -r dest src files mb match; do
   fi
 
   # Duplicates: fetch by Drive ID so the right file lands under the right name.
-  while IFS=$'\t' read -r id target; do
-    [[ -z "${id:-}" ]] && continue
+  # copyid takes many ID/path pairs at once, so a folder with 150 duplicates
+  # costs two rclone invocations rather than three hundred.
+  if [[ $n_dup -gt 0 ]]; then
     td="$WORK/one"; rm -rf "$td"; mkdir -p "$td"
-    if ! rclone backend copyid "${GDRIVE_REMOTE}:" "$id" "$td/" \
+    IDARGS=()
+    while IFS=$'\t' read -r id target; do
+      [[ -z "${id:-}" ]] && continue
+      mkdir -p "$td/$(dirname "$target")"
+      IDARGS+=("$id" "$td/$target")
+    done < "$DUP"
+    if ! rclone backend copyid "${GDRIVE_REMOTE}:" "${IDARGS[@]}" \
            "${COMMON[@]}" --log-file "$LOG" --log-level INFO; then
-      printf '     could not fetch duplicate: %s\n' "$target"; ok=0; continue
+      printf '     could not fetch some duplicates\n'; ok=0
     fi
-    got="$(ls -A "$td" 2>/dev/null | head -1)"
-    if [[ -z "$got" ]]; then
-      printf '     duplicate fetched nothing: %s\n' "$target"; ok=0; continue
+    got=$(find "$td" -type f | wc -l | tr -d ' ')
+    if [[ "$got" -ne "$n_dup" ]]; then
+      printf '     fetched %s of %s duplicates\n' "$got" "$n_dup"; ok=0
     fi
-    rclone copyto "$td/$got" "${dst_path}/${target}" "${COPY_FLAGS[@]}" || {
-      printf '     could not upload duplicate: %s\n' "$target"; ok=0; }
-  done < "$DUP"
-  rm -rf "$WORK/one"
+    if [[ "$got" -gt 0 ]]; then
+      rclone copy "$td" "$dst_path" "${COPY_FLAGS[@]}" || {
+        printf '     could not upload duplicates\n'; ok=0; }
+    fi
+    rm -rf "$td"
+  fi
 
   if [[ $ok -eq 1 ]]; then
     printf '%s\n' "$dest" >> "$STATE"; copied=$((copied + 1))
