@@ -10,6 +10,22 @@
 #   ./migrate.sh --pass 1 --go --only Abbott
 #   ./migrate.sh --pass 1 --verify        # compare file counts, both sides
 #
+# Running several at once
+# -----------------------
+# Folders are processed one at a time, and most of them are small enough that
+# the time goes to listing and connection setup rather than to bytes. Splitting
+# the plan across concurrent runs is therefore the biggest speed lever there is:
+#
+#   ./migrate.sh --pass 1 --go --shard 1/3    # in one Terminal tab
+#   ./migrate.sh --pass 1 --go --shard 2/3    # in another
+#   ./migrate.sh --pass 1 --go --shard 3/3    # in a third
+#
+# Each takes every third folder, so they never touch the same destination.
+# They share one .state file - appending a single short line is atomic, and a
+# folder finished by any shard is skipped by all of them on a later run.
+# Bandwidth limits are per process, so RCLONE_BWLIMIT=1M across three shards
+# is 3 MiB/s in total.
+#
 # Duplicate filenames
 # -------------------
 # Google Drive allows several files to share a name inside one folder;
@@ -55,16 +71,19 @@ GO=0
 VERIFY=0
 ONLY=""
 SKIP_VIDEO=1
+SHARD_I=1
+SHARD_N=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pass)   PASS="$2"; shift 2 ;;
     --plan)   PLAN="$2"; shift 2 ;;
     --only)   ONLY="$2"; shift 2 ;;
+    --shard)  SHARD_I="${2%%/*}"; SHARD_N="${2##*/}"; shift 2 ;;
     --go)     GO=1; shift ;;
     --verify) VERIFY=1; shift ;;
     --include-video) SKIP_VIDEO=0; shift ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -74,6 +93,14 @@ case "$PASS" in
   *) echo "--pass must be 1, 2, or all" >&2; exit 2 ;;
 esac
 
+case "$SHARD_I$SHARD_N" in
+  *[!0-9]*|"") echo "--shard must look like 2/3" >&2; exit 2 ;;
+esac
+if [[ $SHARD_N -lt 1 || $SHARD_I -lt 1 || $SHARD_I -gt $SHARD_N ]]; then
+  echo "--shard must look like 2/3, with the first number no bigger" >&2
+  exit 2
+fi
+
 [[ -f "$PLAN" ]] || { echo "plan file not found: $PLAN" >&2; exit 1; }
 command -v rclone >/dev/null || { echo "rclone not found" >&2; exit 1; }
 
@@ -81,7 +108,8 @@ mkdir -p .state logs
 STATE=".state/done-pass${PASS}.txt"
 touch "$STATE"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="logs/pass${PASS}-${STAMP}.log"
+# $$ keeps concurrent shards out of each other's log.
+LOG="logs/pass${PASS}-${STAMP}-$$.log"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -144,6 +172,7 @@ printf '%s\n' "video:       $([[ $SKIP_VIDEO -eq 1 ]] && echo excluded || echo I
 printf '%s\n' "google docs: exported as $EXPORT_FORMATS"
 printf '%s\n' "source:      ${GDRIVE_REMOTE}:${SRC_ROOT}/"
 printf '%s\n' "destination: ${SF_REMOTE}:"
+[[ $SHARD_N -gt 1 ]] && printf '%s\n' "shard:       $SHARD_I of $SHARD_N"
 if [[ $VERIFY -eq 1 ]]; then
   printf '%s\n' "mode:        VERIFY (reads only)"
 elif [[ $GO -eq 1 ]]; then
@@ -153,8 +182,12 @@ else
 fi
 echo
 
+row=0
 while IFS=$'\t' read -r dest src files mb match; do
   [[ "$dest" == "dest_name" || -z "${dest:-}" ]] && continue
+  # Deal the plan out like cards, so concurrent shards never share a folder.
+  row=$((row + 1))
+  [[ $(( (row - 1) % SHARD_N )) -ne $((SHARD_I - 1)) ]] && continue
   [[ -n "$ONLY" && "$dest" != *"$ONLY"* && "$src" != *"$ONLY"* ]] && continue
   total=$((total + 1))
 
@@ -203,7 +236,8 @@ while IFS=$'\t' read -r dest src files mb match; do
     continue
   fi
 
-  printf '[%d] %s  (%s files' "$total" "$dest" "$expected"
+  # Numbered by plan row, not by loop count, so shards report comparable positions.
+  printf '[%d] %s  (%s files' "$row" "$dest" "$expected"
   [[ $n_dup -gt 0 ]] && printf ', %s renamed' "$n_dup"
   printf ')\n'
 
